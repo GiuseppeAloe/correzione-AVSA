@@ -1,0 +1,937 @@
+#include "VideoWorker.h"
+
+#include <QDateTime>
+#include <QProcess>
+#include <QFileInfo>
+#include <QDir>
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
+
+// ============================================================
+// STEP C – output SOLO positivi
+// ============================================================
+static constexpr int   OUTPUT_MIN_HITS     = 18;
+static constexpr float OUTPUT_MIN_SPEED    = 0.25f;
+static constexpr float MAX_STATIC_SPEED    = 0.10f;
+static constexpr float MAX_AREA_VAR_RATIO  = 0.60f;
+static constexpr float OUTPUT_MIN_DISP_PX  = 12.0f;
+static constexpr float OUTPUT_MIN_STRAIGHT = 0.35f;
+
+// tracking “interno”
+static constexpr int   CAND_CONFIRM_HITS   = 6;
+static constexpr int   CAND_MAX_MISS       = 2;
+static constexpr int   TRACK_MAX_MISS      = 8;
+
+// cerchio dinamico
+static constexpr int   R_MIN = 8;
+static constexpr int   R_MAX = 90;
+static constexpr float R_SCALE = 20.0f;
+
+// warm-up (secondi)
+static constexpr int   WARMUP_SECONDS = 10;
+
+// ============================================================
+// POST-COMPRESS (FFMPEG) - SOLO DOPO ANALISI
+//  - crea un secondo file: *_final.mp4
+//  - non tocca il file originale
+//  - prova h264_nvenc, fallback libx264
+// ============================================================
+static bool runFfmpegCompressToFinal(const QString& inMp4Path, QString* outFinalPathOrNull)
+{
+    QFileInfo inInfo(inMp4Path);
+    if (!inInfo.exists() || !inInfo.isFile())
+        return false;
+
+    const QString low = inMp4Path.toLower();
+    if (!low.endsWith(".mp4"))
+        return false;
+
+    const QString dir = inInfo.absolutePath();
+    const QString base = inInfo.completeBaseName();
+
+    // nome finale progressivo: base_final.mp4, base_final_1.mp4, ...
+    auto makeFinalName = [&](const QString& suffix) -> QString
+    {
+        QDir d(dir);
+        QString candidate = base + suffix + ".mp4";
+        if (!d.exists(candidate))
+            return d.filePath(candidate);
+
+        int idx = 1;
+        while (true)
+        {
+            QString c = base + suffix + "_" + QString::number(idx) + ".mp4";
+            if (!d.exists(c))
+                return d.filePath(c);
+            ++idx;
+        }
+    };
+
+    const QString outPath = makeFinalName("_final");
+
+    // helper: esegui ffmpeg, ritorna exitCode==0
+    auto tryRun = [&](const QStringList& args) -> bool
+    {
+        QProcess p;
+        p.setProgram("ffmpeg");
+        p.setArguments(args);
+        p.setProcessChannelMode(QProcess::MergedChannels);
+        p.start();
+        if (!p.waitForStarted(3000))
+            return false;
+
+        // attendo fine (senza UI, siamo nel thread writer)
+        p.waitForFinished(-1);
+
+        return (p.exitStatus() == QProcess::NormalExit && p.exitCode() == 0);
+    };
+
+    // comando base: input -> output (mp4)
+    // NOTE: -y per sovrascrivere SOLO se il nome coincide (non dovrebbe, ma sicurezza)
+    // NOTE: -movflags +faststart per compatibilità player
+    // NOTE: manteniamo audio se presente (copy), altrimenti non cambia
+    const QString in = inMp4Path;
+    const QString out = outPath;
+
+    // 1) NVENC (molto più piccolo di MP4V, veloce)
+    // CQ 23 (buon compromesso). Se vuoi più piccolo: 25-28.
+    {
+        QStringList args;
+        args << "-hide_banner" << "-loglevel" << "error"
+             << "-y"
+             << "-i" << in
+             << "-c:v" << "h264_nvenc"
+             << "-preset" << "p5"
+             << "-rc" << "vbr"
+             << "-cq" << "23"
+             << "-b:v" << "0"
+             << "-c:a" << "copy"
+             << "-movflags" << "+faststart"
+             << out;
+
+        if (tryRun(args))
+        {
+            if (outFinalPathOrNull) *outFinalPathOrNull = outPath;
+            return true;
+        }
+    }
+
+    // 2) Fallback CPU (libx264) - più lento ma sempre disponibile se ffmpeg è ok
+    {
+        QStringList args;
+        args << "-hide_banner" << "-loglevel" << "error"
+             << "-y"
+             << "-i" << in
+             << "-c:v" << "libx264"
+             << "-preset" << "veryfast"
+             << "-crf" << "23"
+             << "-c:a" << "copy"
+             << "-movflags" << "+faststart"
+             << out;
+
+        if (tryRun(args))
+        {
+            if (outFinalPathOrNull) *outFinalPathOrNull = outPath;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+VideoWorker::VideoWorker(QObject* parent)
+    : QObject(parent)
+{
+    connect(&timer, &QTimer::timeout, this, &VideoWorker::onTick);
+}
+
+// ------------------------------------------------------------
+// SETTER
+// ------------------------------------------------------------
+void VideoWorker::setOutputVideo(const QString& path) { outVideoPath = path; }
+void VideoWorker::setOutputCsv(const QString& path)   { outCsvPath   = path; }
+void VideoWorker::setOutputCodec(OutputCodec codec)   { outCodec     = codec; }
+
+void VideoWorker::setUseRoiForAnalysis(bool on) { useRoiForAnalysis = on; }
+void VideoWorker::setDrawRoiOnOutput(bool on)   { drawRoiOnOutput  = on; }
+
+void VideoWorker::setRoi(const QPolygonF& poly, const QSize& frameSize)
+{
+    roiPoly = poly;
+    roiFrameSize = frameSize;
+    roiMaskDirty = true;
+}
+
+// ------------------------------------------------------------
+// COLORI STABILI DA ID
+// ------------------------------------------------------------
+cv::Scalar VideoWorker::colorForId(int id)
+{
+    int c = id * 37;
+    return cv::Scalar(
+        50 + (c * 3) % 200,
+        50 + (c * 7) % 200,
+        50 + (c * 11) % 200
+    );
+}
+
+// ------------------------------------------------------------
+// ROI MASK
+// ------------------------------------------------------------
+void VideoWorker::rebuildRoiMaskIfNeeded()
+{
+    if (!useRoiForAnalysis || !roiMaskDirty) return;
+    if (roiPoly.size() < 3 || roiFrameSize.isEmpty()) return;
+
+    roiMask = cv::Mat::zeros(roiFrameSize.height(), roiFrameSize.width(), CV_8UC1);
+
+    std::vector<cv::Point> pts;
+    pts.reserve((size_t)roiPoly.size());
+    for (auto& p : roiPoly)
+        pts.emplace_back((int)p.x(), (int)p.y());
+
+    cv::fillPoly(roiMask, std::vector<std::vector<cv::Point>>{pts}, cv::Scalar(255));
+    roiMaskDirty = false;
+}
+
+// ------------------------------------------------------------
+// OPEN VIDEO (preview frame)
+// ------------------------------------------------------------
+void VideoWorker::openVideo(const QString& path)
+{
+    stopPlayback();
+
+    if (writer.isOpened()) writer.release();
+    if (csv.is_open()) csv.close();
+    csvPendingOpen = false;
+
+    cap.release();
+    bg.release();
+    accum.release();
+
+    cands.clear();
+    tracks.clear();
+    nextTrackId = 1;
+
+    // output ids
+    outIdMap.clear();
+    nextOutId = 1;
+
+    if (!cap.open(path.toStdString()))
+    {
+        emit error("Impossibile aprire il video");
+        return;
+    }
+
+    double vidFps = cap.get(cv::CAP_PROP_FPS);
+    if (vidFps > 0 && vidFps < 120) fps = (int)vidFps;
+
+    totalFrames  = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
+    currentFrame = 0;
+
+    cv::Mat f;
+    cap >> f;
+    if (f.empty())
+    {
+        emit error("Frame iniziale vuoto");
+        return;
+    }
+
+    // preview
+    cv::Mat rgb;
+    cv::cvtColor(f, rgb, cv::COLOR_BGR2RGB);
+    QImage img(rgb.data, rgb.cols, rgb.rows, rgb.step, QImage::Format_RGB888);
+    emit liveFrameReady(img.copy());
+
+    // IMPORTANT: torna all’inizio così non perdi il primo frame in analisi
+    cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+}
+
+// ------------------------------------------------------------
+// OUTPUT WRITER OPEN (SOLO ENCODING/OUTPUT)
+// BETA-SAFE:
+// - SOLO MP4
+// - NIENTE MJPG
+// - NIENTE AVI
+// - prova backend Windows (MSMF) e poi FFMPEG se disponibile
+// - se fallisce: output video disabilitato (NO CRASH)
+// ------------------------------------------------------------
+bool VideoWorker::openOutputWriter(int w, int h)
+{
+    if (outVideoPath.isEmpty())
+        return false;
+
+    // Evita qualunque possibilità di finire su AVI/Images writer:
+    // per la BETA accettiamo SOLO .mp4
+    const QString low = outVideoPath.toLower();
+    if (!low.endsWith(".mp4"))
+        return false;
+
+    if (writer.isOpened())
+        writer.release();
+
+    const int fourcc_mp4v = cv::VideoWriter::fourcc('m','p','4','v');
+    const int fourcc_avc1 = cv::VideoWriter::fourcc('a','v','c','1');
+    const int fourcc_h264 = cv::VideoWriter::fourcc('H','2','6','4');
+
+    const cv::Size sz(w, h);
+    const std::string path = outVideoPath.toStdString();
+
+    auto tryOpen = [&](int api, int fourcc) -> bool
+    {
+        if (writer.isOpened())
+            writer.release();
+
+        // se api == 0 usa open "normale"
+        if (api == 0)
+            return writer.open(path, fourcc, fps, sz, true) && writer.isOpened();
+
+        return writer.open(path, api, fourcc, fps, sz, true) && writer.isOpened();
+    };
+
+    bool ok = false;
+
+    // Scelta codec:
+    // - Auto: MP4V (compatibile) con MSMF, poi MP4V default, poi H264 via FFMPEG se c'è
+    // - H264: prova H264 via FFMPEG, poi MP4V MSMF, poi MP4V default
+    // - MJPEG: per BETA NON supportato (evitiamo file enormi/AVI)
+    if (outCodec == OutputCodec::MJPEG)
+    {
+        ok = false;
+    }
+    else if (outCodec == OutputCodec::H264)
+    {
+        ok = tryOpen(cv::CAP_FFMPEG, fourcc_avc1);
+        if (!ok) ok = tryOpen(cv::CAP_FFMPEG, fourcc_h264);
+        if (!ok) ok = tryOpen(cv::CAP_MSMF,  fourcc_mp4v);
+        if (!ok) ok = tryOpen(0,            fourcc_mp4v);
+    }
+    else // Auto
+    {
+        ok = tryOpen(cv::CAP_MSMF, fourcc_mp4v);
+        if (!ok) ok = tryOpen(0,           fourcc_mp4v);
+        if (!ok) ok = tryOpen(cv::CAP_FFMPEG, fourcc_avc1);
+        if (!ok) ok = tryOpen(cv::CAP_FFMPEG, fourcc_h264);
+    }
+
+    if (!ok || !writer.isOpened())
+    {
+        if (writer.isOpened()) writer.release();
+        return false;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// START / STOP (MT pipeline)
+// ------------------------------------------------------------
+void VideoWorker::startPlayback()
+{
+    if (!cap.isOpened()) return;
+
+    stopRequested.store(false);
+
+    // reset queues
+    qIn.clear();
+    qOut.clear();
+
+    int w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+
+    // writer (MP4 only)
+    if (writer.isOpened()) writer.release();
+    if (!outVideoPath.isEmpty())
+    {
+        if (!openOutputWriter(w, h))
+        {
+            // continua senza video (BETA stabile)
+            if (!outVideoPath.isEmpty())
+                emit error("Output video disabilitato: serve path .mp4 e un encoder disponibile (MP4V/H264).");
+            if (writer.isOpened()) writer.release();
+        }
+    }
+
+    // CSV: apertura differita dopo warm-up
+    if (csv.is_open()) csv.close();
+    csvPendingOpen = !outCsvPath.isEmpty();
+
+    // MOG2 + accum
+    bg = cv::createBackgroundSubtractorMOG2(900, 20.0, false);
+
+    accum.release();
+    cands.clear();
+    tracks.clear();
+    nextTrackId = 1;
+
+    // output ids (reset ogni run)
+    outIdMap.clear();
+    nextOutId = 1;
+
+    rebuildRoiMaskIfNeeded();
+    warmupRemaining = std::max(0, fps * WARMUP_SECONDS);
+
+    // se warm-up disabilitato apri subito CSV
+    if (csvPendingOpen && warmupRemaining == 0)
+    {
+        csv.open(outCsvPath.toStdString(), std::ios::out);
+        if (csv.is_open())
+        {
+            csv << "id,frame,timestamp_ms,x,y,speed,area,hits\n";
+            csvPendingOpen = false;
+        }
+    }
+
+    // avvio thread
+    thReader    = std::thread(&VideoWorker::readerLoop, this);
+    thProcessor = std::thread(&VideoWorker::processorLoop, this);
+    thWriter    = std::thread(&VideoWorker::writerLoop, this);
+}
+
+void VideoWorker::stopPlayback()
+{
+    // ferma eventuale timer legacy
+    timer.stop();
+
+    // stop threads
+    stopRequested.store(true);
+    qIn.notifyAll();
+    qOut.notifyAll();
+
+    if (thReader.joinable())    thReader.join();
+    if (thProcessor.joinable()) thProcessor.join();
+    if (thWriter.joinable())    thWriter.join();
+
+    if (writer.isOpened()) writer.release();
+    if (csv.is_open()) csv.close();
+    csvPendingOpen = false;
+}
+
+// ------------------------------------------------------------
+// legacy tick (non usato)
+// ------------------------------------------------------------
+void VideoWorker::onTick()
+{
+    // modalità MT: non usato
+}
+
+// ------------------------------------------------------------
+// POSITIVE FILTER
+// ------------------------------------------------------------
+bool VideoWorker::isPositive(const Track& t) const
+{
+    if (!t.alive) return false;
+    if (t.hits < OUTPUT_MIN_HITS) return false;
+    if (t.speedEma < OUTPUT_MIN_SPEED) return false;
+    if (t.speedEma < MAX_STATIC_SPEED) return false;
+
+    if (t.maxDisp < OUTPUT_MIN_DISP_PX)
+        return false;
+
+    if (t.pathLen > 1e-3f)
+    {
+        float straight = t.maxDisp / t.pathLen;
+        if (straight < OUTPUT_MIN_STRAIGHT)
+            return false;
+    }
+
+    if (t.areaEma > 1.0f)
+    {
+        float varRatio = t.areaVarEma / t.areaEma;
+        if (varRatio > MAX_AREA_VAR_RATIO)
+            return false;
+    }
+
+    return true;
+}
+
+// ------------------------------------------------------------
+// MATCH DET -> CAND
+// ------------------------------------------------------------
+void VideoWorker::matchDetectionsToCandidates(
+    const std::vector<std::pair<cv::Point2f, float>>& detections,
+    std::vector<int>& detAssignedCand)
+{
+    const float MAX_DIST = 18.f;
+    const float MAX_D2 = MAX_DIST * MAX_DIST;
+
+    detAssignedCand.assign(detections.size(), -1);
+
+    for (int ci = 0; ci < (int)cands.size(); ++ci)
+    {
+        auto& c = cands[ci];
+        if (!c.alive) continue;
+
+        int bestDi = -1;
+        float bestD2 = std::numeric_limits<float>::max();
+
+        for (int di = 0; di < (int)detections.size(); ++di)
+        {
+            if (detAssignedCand[di] != -1) continue;
+
+            cv::Point2f p = detections[di].first;
+            float dx = p.x - c.pos.x;
+            float dy = p.y - c.pos.y;
+            float d2 = dx*dx + dy*dy;
+
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                bestDi = di;
+            }
+        }
+
+        if (bestDi != -1 && bestD2 <= MAX_D2)
+            detAssignedCand[bestDi] = ci;
+    }
+}
+
+// ------------------------------------------------------------
+// MATCH DET -> TRACK
+// ------------------------------------------------------------
+void VideoWorker::matchDetectionsToTracks(
+    const std::vector<std::pair<cv::Point2f, float>>& detections,
+    std::vector<int>& detAssignedTrack)
+{
+    const float MAX_DIST = 26.f;
+    const float MAX_D2 = MAX_DIST * MAX_DIST;
+
+    detAssignedTrack.assign(detections.size(), -1);
+
+    for (int ti = 0; ti < (int)tracks.size(); ++ti)
+    {
+        auto& t = tracks[ti];
+        if (!t.alive) continue;
+
+        int bestDi = -1;
+        float bestD2 = std::numeric_limits<float>::max();
+
+        for (int di = 0; di < (int)detections.size(); ++di)
+        {
+            if (detAssignedTrack[di] != -1) continue;
+
+            cv::Point2f p = detections[di].first;
+            float dx = p.x - t.pos.x;
+            float dy = p.y - t.pos.y;
+            float d2 = dx*dx + dy*dy;
+
+            if (d2 < bestD2)
+            {
+                bestD2 = d2;
+                bestDi = di;
+            }
+        }
+
+        if (bestDi != -1 && bestD2 <= MAX_D2)
+            detAssignedTrack[bestDi] = ti;
+    }
+}
+
+// ------------------------------------------------------------
+// PROMOZIONE CAND -> TRACK
+// ------------------------------------------------------------
+void VideoWorker::promoteCandidatesToTracks()
+{
+    for (auto& c : cands)
+    {
+        if (!c.alive) continue;
+        if (c.hits < CAND_CONFIRM_HITS) continue;
+
+        Track t;
+        t.id = nextTrackId++;
+        t.pos = c.pos;
+        t.startPos = c.pos;
+        t.pathLen = 0.f;
+        t.maxDisp = 0.f;
+        t.areaEma = c.areaEma;
+        t.areaVarEma = c.areaVarEma;
+        t.speedEma = c.speedEma;
+        t.hits = c.hits;
+        t.missed = 0;
+        t.alive = true;
+
+        tracks.push_back(t);
+        c.alive = false;
+    }
+
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+                              [](const Candidate& c){ return !c.alive; }),
+                cands.end());
+}
+
+// ------------------------------------------------------------
+// STEP: aggiornamento candidati e track + anti-duplicazione
+// ------------------------------------------------------------
+void VideoWorker::stepCandidatesAndTracks(
+    const std::vector<std::pair<cv::Point2f, float>>& detections)
+{
+    const float EMA = 0.25f;
+
+    for (auto& t : tracks) if (t.alive) t.missed++;
+    for (auto& c : cands)  if (c.alive) c.missed++;
+
+    std::vector<int> detToTrack;
+    matchDetectionsToTracks(detections, detToTrack);
+
+    std::vector<char> detUsed(detections.size(), 0);
+
+    for (int di = 0; di < (int)detections.size(); ++di)
+    {
+        int ti = detToTrack[di];
+        if (ti < 0) continue;
+
+        auto& t = tracks[ti];
+        if (!t.alive) continue;
+
+        cv::Point2f p = detections[di].first;
+        float area = detections[di].second;
+
+        float step = cv::norm(p - t.pos);
+        t.speedEma   = (1.f - EMA) * t.speedEma + EMA * step;
+        t.pathLen    += step;
+        float disp = cv::norm(p - t.startPos);
+        if (disp > t.maxDisp) t.maxDisp = disp;
+
+        t.areaVarEma = (1.f - EMA) * t.areaVarEma + EMA * std::abs(area - t.areaEma);
+        t.areaEma    = (1.f - EMA) * t.areaEma + EMA * area;
+
+        t.pos = p;
+        t.hits++;
+        t.missed = 0;
+
+        detUsed[di] = 1;
+    }
+
+    for (auto& t : tracks)
+        if (t.alive && t.missed > TRACK_MAX_MISS)
+            t.alive = false;
+
+    std::vector<std::pair<cv::Point2f, float>> detLeft;
+    detLeft.reserve(detections.size());
+
+    for (int di = 0; di < (int)detections.size(); ++di)
+        if (!detUsed[di])
+            detLeft.push_back(detections[di]);
+
+    if (!detLeft.empty())
+    {
+        std::vector<int> detToCand;
+        matchDetectionsToCandidates(detLeft, detToCand);
+
+        std::vector<char> leftUsed(detLeft.size(), 0);
+
+        for (int li = 0; li < (int)detLeft.size(); ++li)
+        {
+            int ci = detToCand[li];
+            if (ci < 0) continue;
+
+            auto& c = cands[ci];
+            if (!c.alive) continue;
+
+            cv::Point2f p = detLeft[li].first;
+            float area = detLeft[li].second;
+
+            float speed = cv::norm(p - c.pos);
+            c.speedEma   = (1.f - EMA) * c.speedEma + EMA * speed;
+            c.areaVarEma = (1.f - EMA) * c.areaVarEma + EMA * std::abs(area - c.areaEma);
+            c.areaEma    = (1.f - EMA) * c.areaEma + EMA * area;
+
+            c.pos = p;
+            c.hits++;
+            c.missed = 0;
+
+            leftUsed[li] = 1;
+        }
+
+        for (int li = 0; li < (int)detLeft.size(); ++li)
+        {
+            if (leftUsed[li]) continue;
+
+            const cv::Point2f& p = detLeft[li].first;
+            bool suppressed = false;
+
+            for (const auto& t : tracks)
+            {
+                if (!t.alive) continue;
+
+                float dx = p.x - t.pos.x;
+                float dy = p.y - t.pos.y;
+                float dist2 = dx*dx + dy*dy;
+
+                float rBlob = std::sqrt(std::max(0.0f, t.areaEma) / 3.1415926f);
+                float rSuppress = std::max(12.0f, rBlob * 1.5f);
+                float r2 = rSuppress * rSuppress;
+
+                if (dist2 < r2)
+                {
+                    suppressed = true;
+                    break;
+                }
+            }
+
+            if (suppressed)
+                continue;
+
+            Candidate c;
+            c.pos = p;
+            c.areaEma = detLeft[li].second;
+            c.areaVarEma = 0.f;
+            c.speedEma = 0.f;
+            c.hits = 1;
+            c.missed = 0;
+            c.alive = true;
+            cands.push_back(c);
+        }
+    }
+
+    for (auto& c : cands)
+        if (c.alive && c.missed > CAND_MAX_MISS)
+            c.alive = false;
+
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+                              [](const Candidate& c){ return !c.alive; }),
+                cands.end());
+
+    promoteCandidatesToTracks();
+
+    tracks.erase(std::remove_if(tracks.begin(), tracks.end(),
+                               [](const Track& t){ return !t.alive; }),
+                 tracks.end());
+}
+
+// ------------------------------------------------------------
+// PROCESS FRAME
+// ------------------------------------------------------------
+void VideoWorker::processFrame(cv::Mat& frameBgr)
+{
+    if (!bg)
+        return;
+
+    cv::Mat fg;
+    bg->apply(frameBgr, fg, 0.001);
+
+    rebuildRoiMaskIfNeeded();
+    if (useRoiForAnalysis && !roiMask.empty() && roiMask.size() == fg.size())
+        cv::bitwise_and(fg, roiMask, fg);
+
+    if (accum.empty())
+        accum = cv::Mat::zeros(fg.size(), CV_32F);
+
+    cv::Mat fgf;
+    fg.convertTo(fgf, CV_32F, 1.0/255.0);
+    accum = accum * 0.965f + fgf * 0.035f;
+
+    if (warmupRemaining > 0)
+        return;
+
+    cv::Mat bin;
+    cv::threshold(accum, bin, 0.26, 1.0, cv::THRESH_BINARY);
+    bin.convertTo(bin, CV_8U, 255);
+
+    cv::erode(bin, bin, cv::Mat(), cv::Point(-1,-1), 1);
+    cv::dilate(bin, bin, cv::Mat(), cv::Point(-1,-1), 1);
+
+    std::vector<std::vector<cv::Point>> cont;
+    cv::findContours(bin, cont, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    std::vector<std::pair<cv::Point2f, float>> detections;
+    detections.reserve(cont.size());
+
+    for (auto& c : cont)
+    {
+        float a = (float)cv::contourArea(c);
+        if (a < 2.0f || a > 130.0f) continue;
+
+        auto m = cv::moments(c);
+        if (m.m00 == 0.0) continue;
+
+        cv::Point2f center((float)(m.m10/m.m00), (float)(m.m01/m.m00));
+        detections.emplace_back(center, a);
+    }
+
+    stepCandidatesAndTracks(detections);
+}
+
+// ============================================================
+// THREAD LOOPS
+// ============================================================
+void VideoWorker::readerLoop()
+{
+    int idx = 0;
+    while (!stopRequested.load())
+    {
+        cv::Mat bgr;
+        if (!cap.read(bgr) || bgr.empty())
+        {
+            RawFrame end;
+            end.frameIndex = -1;
+            qIn.push(end, stopRequested);
+            break;
+        }
+
+        RawFrame rf;
+        rf.bgr = bgr;
+        rf.frameIndex = ++idx;
+
+        if (!qIn.push(rf, stopRequested))
+            break;
+    }
+}
+
+void VideoWorker::processorLoop()
+{
+    RawFrame rf;
+
+    while (!stopRequested.load())
+    {
+        if (!qIn.pop(rf, stopRequested))
+            break;
+
+        if (rf.frameIndex < 0)
+        {
+            ProcFrame end;
+            end.frameIndex = -1;
+            qOut.push(end, stopRequested);
+            break;
+        }
+
+        currentFrame = rf.frameIndex;
+
+        int percent = 0;
+        if (totalFrames > 0)
+            percent = (int)(100.0 * currentFrame / totalFrames);
+
+        if (warmupRemaining > 0)
+            warmupRemaining--;
+
+        if (csvPendingOpen && warmupRemaining == 0)
+        {
+            csv.open(outCsvPath.toStdString(), std::ios::out);
+            if (csv.is_open())
+            {
+                csv << "id,frame,timestamp_ms,x,y,speed,area,hits\n";
+                csvPendingOpen = false;
+            }
+        }
+
+        // tracking/detection
+        processFrame(rf.bgr);
+
+        // ROI overlay su output
+        if (drawRoiOnOutput && roiPoly.size() >= 3)
+        {
+            std::vector<cv::Point> pts;
+            pts.reserve((size_t)roiPoly.size());
+            for (auto& p : roiPoly)
+                pts.emplace_back((int)p.x(), (int)p.y());
+
+            const cv::Point* pp[1] = { pts.data() };
+            int np[1] = { (int)pts.size() };
+            cv::polylines(rf.bgr, pp, np, 1, true, cv::Scalar(0,255,255), 2);
+        }
+
+        // STEP C: disegna/salva SOLO positivi
+        qint64 ts = QDateTime::currentMSecsSinceEpoch();
+
+        if (warmupRemaining == 0)
+        {
+            for (const auto& t : tracks)
+            {
+                if (!isPositive(t)) continue;
+
+                float rBlob = std::sqrt(std::max(1.0f, t.areaEma) / 3.1415926f);
+                float r = std::max((float)R_MIN, rBlob * R_SCALE);
+                r = std::min((float)R_MAX, r);
+
+                int outId = 0;
+                auto it = outIdMap.find(t.id);
+                if (it == outIdMap.end())
+                {
+                    outId = nextOutId++;
+                    outIdMap.emplace(t.id, outId);
+                }
+                else
+                {
+                    outId = it->second;
+                }
+
+                cv::Scalar col = colorForId(outId);
+
+                cv::circle(rf.bgr, t.pos, (int)std::round(r), col, 2, cv::LINE_AA);
+                cv::putText(rf.bgr,
+                            "ID " + std::to_string(outId),
+                            t.pos + cv::Point2f(r + 4.f, -4.f),
+                            cv::FONT_HERSHEY_SIMPLEX,
+                            0.45, col, 1, cv::LINE_AA);
+
+                if (csv.is_open())
+                {
+                    csv << outId << ","
+                        << currentFrame << ","
+                        << ts << ","
+                        << (int)std::round(t.pos.x) << ","
+                        << (int)std::round(t.pos.y) << ","
+                        << t.speedEma << ","
+                        << t.areaEma << ","
+                        << t.hits
+                        << "\n";
+                }
+            }
+        }
+
+        ProcFrame pf;
+        pf.bgr = rf.bgr;
+        pf.frameIndex = rf.frameIndex;
+        pf.percent = percent;
+
+        if (!qOut.push(pf, stopRequested))
+            break;
+    }
+}
+
+void VideoWorker::writerLoop()
+{
+    ProcFrame pf;
+
+    while (!stopRequested.load())
+    {
+        if (!qOut.pop(pf, stopRequested))
+            break;
+
+        if (pf.frameIndex < 0)
+        {
+            // ===== FINE FILE =====
+            // IMPORTANTISSIMO: flush/close QUI, altrimenti il file mp4 resta "in memoria"
+            if (writer.isOpened())
+                writer.release();
+
+            if (csv.is_open())
+                csv.close();
+
+            // post-compress: crea *_final.mp4 (non tocca l'originale)
+            if (!outVideoPath.isEmpty())
+            {
+                QString finalPath;
+                runFfmpegCompressToFinal(outVideoPath, &finalPath);
+                // niente emit error qui: se ffmpeg fallisce, il file originale resta valido
+            }
+
+            emit progress(100);
+            emit finished();
+            break;
+        }
+
+        emit progress(pf.percent);
+
+        // Scrive SOLO se MP4 writer è realmente aperto
+        if (writer.isOpened())
+            writer.write(pf.bgr);
+
+        cv::Mat rgb;
+        cv::cvtColor(pf.bgr, rgb, cv::COLOR_BGR2RGB);
+        QImage img(rgb.data, rgb.cols, rgb.rows, rgb.step, QImage::Format_RGB888);
+        emit liveFrameReady(img.copy());
+    }
+}

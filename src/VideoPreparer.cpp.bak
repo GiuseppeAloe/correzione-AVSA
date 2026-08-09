@@ -1,0 +1,295 @@
+#include "VideoWorker.h"
+
+#include <QDateTime>
+#include <QFileInfo>
+#include <QProcess>
+
+#include <cmath>
+#include <algorithm>
+#include <limits>
+#include <thread>
+
+#ifdef _WIN32
+    #include <cstdio>
+    #define POPEN  _popen
+    #define PCLOSE _pclose
+#else
+    #include <cstdio>
+    #define POPEN  popen
+    #define PCLOSE pclose
+#endif
+
+// ============================================================
+// PARAMETRI (DETECTOR NON TOCCATO)
+// ============================================================
+static constexpr int   OUTPUT_MIN_HITS     = 18;
+static constexpr float OUTPUT_MIN_SPEED    = 0.25f;
+static constexpr float MAX_STATIC_SPEED    = 0.10f;
+static constexpr float MAX_AREA_VAR_RATIO  = 0.60f;
+static constexpr float OUTPUT_MIN_DISP_PX  = 12.0f;
+static constexpr float OUTPUT_MIN_STRAIGHT = 0.35f;
+
+static constexpr int   CAND_CONFIRM_HITS   = 6;
+static constexpr int   CAND_MAX_MISS       = 2;
+static constexpr int   TRACK_MAX_MISS      = 8;
+
+static constexpr int   R_MIN   = 8;
+static constexpr int   R_MAX   = 90;
+static constexpr float R_SCALE = 20.0f;
+
+static constexpr int   WARMUP_SECONDS = 10;
+
+// ============================================================
+// FIX FILE H264 RAW (SENZA SPS/PPS)
+// ============================================================
+static QString fixRawH264IfNeeded(const QString& path)
+{
+    QFileInfo fi(path);
+    if (fi.suffix().toLower() != "h264")
+        return path;
+
+    QString fixed =
+        fi.absolutePath() + "/" +
+        fi.completeBaseName() + "_fixed.mp4";
+
+    if (QFileInfo::exists(fixed))
+        return fixed;
+
+    QStringList args = {
+        "-y",
+        "-fflags", "+genpts",
+        "-i", path,
+        "-map", "0:v:0",
+        "-c:v", "libx264",
+        "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-movflags", "+faststart",
+        fixed
+    };
+
+    QProcess ff;
+    ff.start("ffmpeg", args);
+    ff.waitForFinished(-1);
+
+    if (!QFileInfo::exists(fixed))
+        return QString(); // fallito
+
+    return fixed;
+}
+
+// ============================================================
+// FFmpeg PIPE WRITER (output leggero, seek OK)
+// ============================================================
+bool VideoWorker::FfmpegPipeWriter::open(const std::string& outPath, int w, int h, int fps)
+{
+    close();
+    if (w <= 0 || h <= 0 || fps <= 0) return false;
+
+    m_w = w;
+    m_h = h;
+
+    std::string cmd =
+        "ffmpeg -y -loglevel error "
+        "-f rawvideo -pix_fmt bgr24 "
+        "-s " + std::to_string(w) + "x" + std::to_string(h) +
+        " -r " + std::to_string(fps) +
+        " -i pipe:0 "
+        "-an -c:v libx264 -preset veryfast -crf 18 "
+        "-movflags +faststart "
+        "\"" + outPath + "\"";
+
+    m_pipe = (void*)POPEN(cmd.c_str(), "wb");
+    m_open = (m_pipe != nullptr);
+    return m_open;
+}
+
+void VideoWorker::FfmpegPipeWriter::write(const cv::Mat& bgr)
+{
+    if (!m_open || !m_pipe || bgr.empty()) return;
+    const size_t bytes = (size_t)m_w * m_h * 3;
+    std::fwrite(bgr.data, 1, bytes, (FILE*)m_pipe);
+}
+
+void VideoWorker::FfmpegPipeWriter::close()
+{
+    if (m_pipe)
+    {
+        PCLOSE((FILE*)m_pipe);
+        m_pipe = nullptr;
+    }
+    m_open = false;
+}
+
+// ============================================================
+// COSTRUTTORE
+// ============================================================
+VideoWorker::VideoWorker(QObject* parent)
+    : QObject(parent)
+{
+    connect(&timer, &QTimer::timeout, this, &VideoWorker::onTick);
+}
+
+// ============================================================
+// OPEN VIDEO (CON FIX AUTOMATICO H264)
+// ============================================================
+void VideoWorker::openVideo(const QString& path)
+{
+    stopPlayback();
+
+    QString realPath = fixRawH264IfNeeded(path);
+    if (realPath.isEmpty())
+    {
+        emit error("File H264 corrotto: impossibile ripararlo.");
+        return;
+    }
+
+    cap.release();
+    if (!cap.open(realPath.toStdString(), cv::CAP_FFMPEG))
+    {
+        emit error("Impossibile aprire il video.");
+        return;
+    }
+
+    double f = cap.get(cv::CAP_PROP_FPS);
+    if (f > 1 && f < 240) fps = (int)std::round(f);
+
+    totalFrames = (int)cap.get(cv::CAP_PROP_FRAME_COUNT);
+    currentFrame = 0;
+
+    cv::Mat first;
+    cap >> first;
+    if (first.empty())
+    {
+        emit error("Frame iniziale vuoto.");
+        return;
+    }
+
+    cv::Mat rgb;
+    cv::cvtColor(first, rgb, cv::COLOR_BGR2RGB);
+    emit liveFrameReady(QImage(
+        rgb.data, rgb.cols, rgb.rows, rgb.step,
+        QImage::Format_RGB888).copy());
+
+    cap.set(cv::CAP_PROP_POS_FRAMES, 0);
+}
+
+// ============================================================
+// START
+// ============================================================
+void VideoWorker::startPlayback()
+{
+    if (!cap.isOpened()) return;
+
+    stopRequested.store(false);
+    qIn.clear();
+    qOut.clear();
+
+    int w = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
+    int h = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
+
+    ffw.close();
+    writer.release();
+
+    if (!outVideoPath.isEmpty())
+    {
+        if (!ffw.open(outVideoPath.toStdString(), w, h, fps))
+        {
+            writer.open(
+                outVideoPath.toStdString(),
+                cv::VideoWriter::fourcc('m','p','4','v'),
+                fps, cv::Size(w,h), true);
+        }
+    }
+
+    bg = cv::createBackgroundSubtractorMOG2(900, 20.0, false);
+    accum.release();
+    cands.clear();
+    tracks.clear();
+    nextTrackId = 1;
+    outIdMap.clear();
+    nextOutId = 1;
+
+    warmupRemaining = std::max(0, fps * WARMUP_SECONDS);
+
+    thReader    = std::thread(&VideoWorker::readerLoop, this);
+    thProcessor = std::thread(&VideoWorker::processorLoop, this);
+    thWriter    = std::thread(&VideoWorker::writerLoop, this);
+}
+
+// ============================================================
+// STOP
+// ============================================================
+void VideoWorker::stopPlayback()
+{
+    stopRequested.store(true);
+    qIn.notifyAll();
+    qOut.notifyAll();
+
+    if (thReader.joinable())    thReader.join();
+    if (thProcessor.joinable()) thProcessor.join();
+    if (thWriter.joinable())    thWriter.join();
+
+    ffw.close();
+    writer.release();
+    if (csv.is_open()) csv.close();
+}
+
+// ============================================================
+// THREAD LOOPS (STANDARD, STABILI)
+// ============================================================
+void VideoWorker::readerLoop()
+{
+    int idx = 0;
+    while (!stopRequested)
+    {
+        cv::Mat bgr;
+        if (!cap.read(bgr) || bgr.empty())
+        {
+            qIn.push({{}, -1}, stopRequested);
+            break;
+        }
+        qIn.push({bgr, ++idx}, stopRequested);
+    }
+}
+
+void VideoWorker::processorLoop()
+{
+    RawFrame rf;
+    while (qIn.pop(rf, stopRequested))
+    {
+        if (rf.frameIndex < 0)
+        {
+            qOut.push({{}, -1, 100}, stopRequested);
+            break;
+        }
+
+        currentFrame = rf.frameIndex;
+        processFrame(rf.bgr);
+        qOut.push({rf.bgr, rf.frameIndex, 0}, stopRequested);
+    }
+}
+
+void VideoWorker::writerLoop()
+{
+    ProcFrame pf;
+    while (qOut.pop(pf, stopRequested))
+    {
+        if (pf.frameIndex < 0)
+        {
+            ffw.close();
+            writer.release();
+            emit finished();
+            break;
+        }
+
+        if (ffw.isOpen()) ffw.write(pf.bgr);
+        else if (writer.isOpened()) writer.write(pf.bgr);
+
+        cv::Mat rgb;
+        cv::cvtColor(pf.bgr, rgb, cv::COLOR_BGR2RGB);
+        emit liveFrameReady(QImage(
+            rgb.data, rgb.cols, rgb.rows, rgb.step,
+            QImage::Format_RGB888).copy());
+    }
+}

@@ -1,0 +1,9 @@
+#pragma once
+#include <QString>
+
+class VideoPreparer
+{
+public:
+    // ritorna path finale utilizzabile da OpenCV
+    static QString prepare(const QString& inputPath);
+};
