@@ -91,4 +91,3 @@ void MainWindow::onActionInfo()
 
     QMessageBox::about(this, "Info / Crediti", credits);
 }
-#error "FORCE FAIL: VERIFYING FILE USAGE"
