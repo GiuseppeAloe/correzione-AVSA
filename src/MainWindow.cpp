@@ -10,7 +10,8 @@
 #include "MainWindow.h"
 #include "LiveFrameProcessor.h"
 
-
+#include <algorithm>
+#include <cmath>
 #include <thread>
 #include <opencv2/opencv.hpp>
 #include <opencv2/highgui.hpp>
@@ -1187,23 +1188,21 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
 
 
     if (worker_ && worker_->isCudaAvailable()) {
-
-
         cbUseCuda_->setEnabled(true);
-
-
         cbUseCuda_->setText("Usa Accelerazione GPU (CUDA) - Rilevata!");
-
-
     } else {
-
-
+        // FIX BUG4: messaggio diagnostico migliorato per CUDA non rilevata
         cbUseCuda_->setEnabled(false);
-
-
-        cbUseCuda_->setToolTip("Nessuna GPU NVIDIA compatibile rilevata o supporto CUDA non compilato.");
-
-
+        cbUseCuda_->setText("Usa Accelerazione GPU (CUDA) - NON rilevata");
+        cbUseCuda_->setToolTip(
+            "CUDA non disponibile. Verificare:\n"
+            "1. Le DLL CUDA siano nella cartella dell'exe:\n"
+            "   opencv_cudabgsegm*.dll, cudart64_*.dll, cublas64_*.dll\n"
+            "2. Driver NVIDIA aggiornati (>= 520)\n"
+            "3. Il programma sia compilato con CUDA_ENABLED=1"
+        );
+        qDebug() << "CUDA CHECK: getCudaEnabledDeviceCount() returned 0. Check CUDA DLLs in exe folder.";
+        std::cout << "CUDA CHECK: No CUDA devices found. Ensure opencv_cuda*.dll and cudart64_*.dll are in the exe directory." << std::endl;
     }
     std::cout << "DEBUG: MW Ctor End" << std::endl;
 }
@@ -1837,32 +1836,24 @@ void MainWindow::onReset()
 
 
     // Re-check CUDA capability on new worker
-
-
     if (worker_ && worker_->isCudaAvailable()) {
-
-
         cbUseCuda_->setEnabled(true);
-
-
         cbUseCuda_->setText("Usa Accelerazione GPU (CUDA) - Rilevata!");
-
-
     } else {
-
-
+        // FIX BUG4: messaggio diagnostico migliorato per CUDA non rilevata
         cbUseCuda_->setEnabled(false);
-
-
-        cbUseCuda_->setToolTip("Nessuna GPU NVIDIA compatibile rilevata.");
-
-
+        cbUseCuda_->setText("Usa Accelerazione GPU (CUDA) - NON rilevata");
+        cbUseCuda_->setToolTip(
+            "CUDA non disponibile. Verificare:\n"
+            "1. Le DLL CUDA siano nella cartella dell'exe:\n"
+            "   opencv_cudabgsegm*.dll, cudart64_*.dll, cublas64_*.dll\n"
+            "2. Driver NVIDIA aggiornati (>= 520)\n"
+            "3. Il programma sia compilato con CUDA_ENABLED=1"
+        );
         cbUseCuda_->setChecked(false);
-
-
+        qDebug() << "CUDA CHECK: getCudaEnabledDeviceCount() returned 0. Check CUDA DLLs in exe folder.";
+        std::cout << "CUDA CHECK: No CUDA devices found. Ensure opencv_cuda*.dll and cudart64_*.dll are in the exe directory." << std::endl;
     }
-
-
 }
 
 
@@ -2440,7 +2431,63 @@ void MainWindow::onStart()
 
 void MainWindow::onPrimaryObjectDetected(QRectF rect, QPointF center, QSize frameSize)
 {
-    // Placeholder
+    // FIX BUG5B: logica reale di auto-tracking PTZ
+    if (!chkAutoPtz_ || !chkAutoPtz_->isChecked()) return;
+    if (!ptzCtrl_) return;
+    if (frameSize.isEmpty()) return;
+
+    // Calcola l'errore rispetto al centro del frame
+    float frameCx = frameSize.width()  / 2.0f;
+    float frameCy = frameSize.height() / 2.0f;
+    float errX = (float)center.x() - frameCx;  // positivo = destra
+    float errY = (float)center.y() - frameCy;  // positivo = basso
+
+    // Zona morta: se l'oggetto è già vicino al centro (5% del frame), non muovere
+    float deadZoneX = frameSize.width()  * 0.05f;
+    float deadZoneY = frameSize.height() * 0.05f;
+
+    // Calcola velocità PTZ proporzionale all'errore (1-8)
+    int speedX = std::clamp((int)(std::abs(errX) / frameCx * 8.0f), 1, 8);
+    int speedY = std::clamp((int)(std::abs(errY) / frameCy * 8.0f), 1, 8);
+
+    bool moveX = std::abs(errX) > deadZoneX;
+    bool moveY = std::abs(errY) > deadZoneY;
+
+    if (!moveX && !moveY) {
+        // Oggetto centrato: ferma PTZ e resetta watchdog
+        ptzCtrl_->setConnectionDetails(leCamIp_->text(), 80, leCamUser_->text(), leCamPass_->text());
+        ptzCtrl_->sendCustomPtz("stop", "Continuously", 0, 0, 0);
+        autoPtzWatchdog_->stop();
+        if (lblTrackingStatus_) lblTrackingStatus_->setText("Status: Centrato");
+
+        // Zoom automatico: se l'oggetto è piccolo (area < 2% del frame), fai zoom in
+        float frameArea = (float)(frameSize.width() * frameSize.height());
+        float objArea   = (float)(rect.width() * rect.height());
+        float areaRatio = objArea / frameArea;
+        if (areaRatio < 0.02f) {
+            ptzCtrl_->sendPtzCommand("start", "ZoomTele", 2);
+        }
+        return;
+    }
+
+    // Calcola argomenti pan/tilt per comando Continuously
+    // panArg: negativo=sinistra, positivo=destra
+    // tiltArg: Y video invertita rispetto a tilt (Y cresce verso il basso, tilt positivo=su)
+    int panArg  = moveX ? (errX > 0 ? speedX : -speedX) : 0;
+    int tiltArg = moveY ? (errY > 0 ? -speedY : speedY) : 0;
+
+    ptzCtrl_->setConnectionDetails(leCamIp_->text(), 80, leCamUser_->text(), leCamPass_->text());
+    ptzCtrl_->sendCustomPtz("start", "Continuously", panArg, tiltArg, 0);
+
+    // Aggiorna status
+    if (lblTrackingStatus_) {
+        lblTrackingStatus_->setText(QString("Tracking: err(%1,%2) spd(%3,%4)")
+            .arg((int)errX).arg((int)errY).arg(speedX).arg(speedY));
+    }
+
+    // Reset watchdog: se non riceviamo più detection, fermiamo la camera
+    autoPtzWatchdog_->start();
+    lastTargetPos_ = center;
 }
 
 void MainWindow::onPtzStepFinished()
@@ -2466,8 +2513,13 @@ void MainWindow::onRoiPolygonChanged(const QPolygonF& poly)
 
 void MainWindow::onAutoPtzWatchdog()
 {
-    // Placeholder for PTZ watchdog logic
-    // Could reset position if no motion detected for X seconds
+    // FIX BUG5C: nessuna detection per 3 secondi — ferma PTZ
+    if (ptzCtrl_) {
+        ptzCtrl_->setConnectionDetails(leCamIp_->text(), 80, leCamUser_->text(), leCamPass_->text());
+        ptzCtrl_->sendCustomPtz("stop", "Continuously", 0, 0, 0);
+    }
+    if (lblTrackingStatus_) lblTrackingStatus_->setText("Status: Perso oggetto");
+    noDetectCounter_ = 0;
 }
 
 void MainWindow::onVideoInfoReady(int width, int height, double fps, int totalFrames, QString codec)

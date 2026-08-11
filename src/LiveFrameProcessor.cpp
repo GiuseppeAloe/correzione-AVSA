@@ -431,7 +431,9 @@ void LiveFrameProcessor::startPlayback()
     if (useCuda) {
         if (devCount > 0) {
              try {
-                 bgCuda = cv::cuda::createBackgroundSubtractorMOG2(900, 20.0, false);
+                 // FIX BUG3: usa params.accumFrames come history per MOG2 CUDA
+                 int mogHistory = (params.accumFrames > 0) ? params.accumFrames * 10 : 900;
+                 bgCuda = cv::cuda::createBackgroundSubtractorMOG2(mogHistory, 20.0, false);
                  emit logMessage("DEBUG: CUDA MOG2 Created Successfully"); 
                  if (bg) bg.release();
              } catch (const cv::Exception& e) {
@@ -456,7 +458,9 @@ void LiveFrameProcessor::startPlayback()
         || !bgCuda
 #endif
     ) {
-        bg = cv::createBackgroundSubtractorMOG2(900, 20.0, false);
+        // FIX BUG3: usa params.accumFrames come history per MOG2 CPU
+        int mogHistory = (params.accumFrames > 0) ? params.accumFrames * 10 : 900;
+        bg = cv::createBackgroundSubtractorMOG2(mogHistory, 20.0, false);
     }
     std::cout << "DEBUG: BackgroundSubtractorMOG2 created" << std::endl;
 
@@ -863,8 +867,20 @@ void LiveFrameProcessor::processFrame(cv::Mat& frameBgr)
     if (warmupRemaining > 0)
         return;
 
+    // FIX BUG3: soglia accum dipendente da params.sensitivity
+    float accumThresh = 0.40f - (std::clamp(params.sensitivity, 0, 255) / 255.0f) * 0.30f;
+
+    // FIX BUG1: applica maschera ROI su accum prima della threshold
     cv::Mat bin;
-    cv::threshold(accum, bin, 0.26, 1.0, cv::THRESH_BINARY);
+    if (useRoiForAnalysis && !roiMask.empty() && roiMask.size() == accum.size()) {
+        cv::Mat roiMaskF;
+        roiMask.convertTo(roiMaskF, CV_32F, 1.0/255.0);
+        cv::Mat accumMasked;
+        cv::multiply(accum, roiMaskF, accumMasked);
+        cv::threshold(accumMasked, bin, accumThresh, 1.0, cv::THRESH_BINARY);
+    } else {
+        cv::threshold(accum, bin, accumThresh, 1.0, cv::THRESH_BINARY);
+    }
     bin.convertTo(bin, CV_8U, 255);
 
     cv::erode(bin, bin, cv::Mat(), cv::Point(-1,-1), 1);
@@ -876,10 +892,14 @@ void LiveFrameProcessor::processFrame(cv::Mat& frameBgr)
     std::vector<std::pair<cv::Point2f, float>> detections;
     detections.reserve(cont.size());
 
+    // FIX BUG3: usa params.blobMinArea/blobMaxArea invece di valori hardcoded
+    float minArea = (params.blobMinArea > 0) ? (float)params.blobMinArea : 2.0f;
+    float maxArea = (params.blobMaxArea > 0) ? (float)params.blobMaxArea : 130.0f;
+
     for (auto& c : cont)
     {
         float a = (float)cv::contourArea(c);
-        if (a < 2.0f || a > 130.0f) continue;
+        if (a < minArea || a > maxArea) continue;
 
         auto m = cv::moments(c);
         if (m.m00 == 0.0) continue;
@@ -1012,6 +1032,9 @@ void LiveFrameProcessor::processorLoop()
 
         if (warmupRemaining == 0)
         {
+            // FIX BUG5A: emit primaryObjectDetected per il primo oggetto positivo rilevato
+            bool primaryEmitted = false;
+
             for (const auto& t : tracks)
             {
                 if (!isPositive(t)) continue;
@@ -1035,6 +1058,16 @@ void LiveFrameProcessor::processorLoop()
                 cv::Scalar col = colorForId(outId);
 
                 cv::circle(rf.bgr, t.pos, (int)std::round(r), col, 2, cv::LINE_AA);
+
+                // FIX BUG5A: emetti posizione del primo oggetto positivo per auto-tracking PTZ
+                if (!primaryEmitted) {
+                    QRectF rect(t.pos.x - r, t.pos.y - r, r * 2, r * 2);
+                    QPointF center(t.pos.x, t.pos.y);
+                    QSize frameSize(rf.bgr.cols, rf.bgr.rows);
+                    emit primaryObjectDetected(rect, center, frameSize);
+                    primaryEmitted = true;
+                }
+
                 cv::putText(rf.bgr,
                             "ID " + std::to_string(outId),
                             t.pos + cv::Point2f(r + 4.f, -10.f),
@@ -1170,8 +1203,13 @@ void LiveFrameProcessor::writerLoop()
 
 bool LiveFrameProcessor::isCudaAvailable() const { 
 #if CUDA_ENABLED
-    return cv::cuda::getCudaEnabledDeviceCount() > 0;
+    // FIX BUG4: log diagnostico per aiutare l'utente a capire perché CUDA non viene rilevata
+    int count = 0;
+    try { count = cv::cuda::getCudaEnabledDeviceCount(); } catch(...) { count = 0; }
+    std::cout << "CUDA CHECK: getCudaEnabledDeviceCount() = " << count << std::endl;
+    return count > 0;
 #else
+    std::cout << "CUDA CHECK: CUDA_ENABLED not defined in build." << std::endl;
     return false;
 #endif
 }
@@ -1267,8 +1305,20 @@ void LiveFrameProcessor::processFrameCuda(cv::Mat& frameBgr)
 
         if (warmupRemaining > 0) return;
 
+        // FIX BUG3: soglia accum dipendente da params.sensitivity
+        float accumThresh = 0.40f - (std::clamp(params.sensitivity, 0, 255) / 255.0f) * 0.30f;
+
+        // FIX BUG1: applica maschera ROI su accum prima della threshold (CUDA path)
         cv::Mat bin;
-        cv::threshold(accum, bin, 0.26, 1.0, cv::THRESH_BINARY);
+        if (useRoiForAnalysis && !roiMask.empty() && roiMask.size() == accum.size()) {
+            cv::Mat roiMaskF;
+            roiMask.convertTo(roiMaskF, CV_32F, 1.0/255.0);
+            cv::Mat accumMasked;
+            cv::multiply(accum, roiMaskF, accumMasked);
+            cv::threshold(accumMasked, bin, accumThresh, 1.0, cv::THRESH_BINARY);
+        } else {
+            cv::threshold(accum, bin, accumThresh, 1.0, cv::THRESH_BINARY);
+        }
         bin.convertTo(bin, CV_8U, 255);
 
         cv::erode(bin, bin, cv::Mat(), cv::Point(-1,-1), 1);
@@ -1280,10 +1330,14 @@ void LiveFrameProcessor::processFrameCuda(cv::Mat& frameBgr)
         std::vector<std::pair<cv::Point2f, float>> detections;
         detections.reserve(cont.size());
 
+        // FIX BUG3: usa params.blobMinArea/blobMaxArea invece di valori hardcoded
+        float minArea = (params.blobMinArea > 0) ? (float)params.blobMinArea : 2.0f;
+        float maxArea = (params.blobMaxArea > 0) ? (float)params.blobMaxArea : 130.0f;
+
         for (auto& c : cont)
         {
             float a = (float)cv::contourArea(c);
-            if (a < 2.0f || a > 130.0f) continue;
+            if (a < minArea || a > maxArea) continue;
 
             auto m = cv::moments(c);
             if (m.m00 == 0.0) continue;
