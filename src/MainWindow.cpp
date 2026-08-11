@@ -2460,12 +2460,15 @@ void MainWindow::onPrimaryObjectDetected(QRectF rect, QPointF center, QSize fram
         autoPtzWatchdog_->stop();
         if (lblTrackingStatus_) lblTrackingStatus_->setText("Status: Centrato");
 
-        // Zoom automatico: se l'oggetto è piccolo (area < 2% del frame), fai zoom in
+        // Zoom automatico: se l'oggetto è piccolo (area < 2% del frame), fai zoom in;
+        // se è troppo grande (area > 15% del frame), fai zoom out
         float frameArea = (float)(frameSize.width() * frameSize.height());
         float objArea   = (float)(rect.width() * rect.height());
         float areaRatio = objArea / frameArea;
         if (areaRatio < 0.02f) {
             ptzCtrl_->sendPtzCommand("start", "ZoomTele", 2);
+        } else if (areaRatio > 0.15f) {
+            ptzCtrl_->sendPtzCommand("start", "ZoomWide", 2);
         }
         return;
     }

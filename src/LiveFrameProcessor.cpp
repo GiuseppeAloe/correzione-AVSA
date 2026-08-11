@@ -1203,13 +1203,11 @@ void LiveFrameProcessor::writerLoop()
 
 bool LiveFrameProcessor::isCudaAvailable() const { 
 #if CUDA_ENABLED
-    // FIX BUG4: log diagnostico per aiutare l'utente a capire perché CUDA non viene rilevata
+    // FIX BUG4: catch exceptions in case CUDA DLLs are missing at runtime
     int count = 0;
     try { count = cv::cuda::getCudaEnabledDeviceCount(); } catch(...) { count = 0; }
-    std::cout << "CUDA CHECK: getCudaEnabledDeviceCount() = " << count << std::endl;
     return count > 0;
 #else
-    std::cout << "CUDA CHECK: CUDA_ENABLED not defined in build." << std::endl;
     return false;
 #endif
 }
