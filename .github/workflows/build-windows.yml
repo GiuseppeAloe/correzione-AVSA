@@ -73,7 +73,7 @@ jobs:
         Write-Host "Installing OpenCV with CUDA support..."
         # Use manifest mode with specific features
         ./vcpkg install `
-          "opencv4[core,highgui,videoio,imgproc,imgcodecs,calib3d,features2d,cuda,cudaarithm,cudabgsegm,cudafilters,cudaimgproc,nonfree,contrib]:x64-windows" `
+          "opencv4[cuda,cudaarithm,cudabgsegm,cudafilters,cudaimgproc,contrib,nonfree,highgui,jpeg,png,quirc,tiff,webp]:x64-windows" `
           --recurse `
           --no-print-usage
 
