@@ -10,17 +10,11 @@ on:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 120
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
-    - name: Install CUDA Toolkit 12.x
-      uses: Jimver/cuda-toolkit@v0.2.16
-      with:
-        cuda: '12.4.1'
-        method: 'network'
-        sub-packages: '["nvcc", "cudart", "cublas", "cublaslt"]'
 
     - name: Install Qt6
       uses: jurplel/install-qt-action@v3
@@ -32,53 +26,131 @@ jobs:
         modules: 'qtbase qtnetwork'
         cache: true
 
+    - name: Install CUDA Toolkit 12.4 (dev components only)
+      shell: pwsh
+      run: |
+        # Download CUDA network installer
+        $url = "https://developer.download.nvidia.com/compute/cuda/12.4.1/network_installers/cuda_12.4.1_windows_network.exe"
+        $installer = "$env:TEMP\cuda_installer.exe"
+        Write-Host "Downloading CUDA installer..."
+        Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
+
+        Write-Host "Installing CUDA dev components (no driver)..."
+        # Install only compiler and dev libraries, skip driver and display components
+        Start-Process -FilePath $installer -ArgumentList `
+          "-s", "nvcc_12.4", "cudart_12.4", "cublas_dev_12.4", "visual_studio_integration_12.4" `
+          -Wait -NoNewWindow
+
+        # Add CUDA to PATH
+        $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+        echo "CUDA_PATH=$cudaPath" >> $env:GITHUB_ENV
+        echo "$cudaPath\bin" >> $env:GITHUB_PATH
+        echo "$cudaPath\libnvvp" >> $env:GITHUB_PATH
+
+        Write-Host "CUDA installation completed"
+        if (Test-Path "$cudaPath\bin\nvcc.exe") {
+          Write-Host "nvcc found OK"
+        } else {
+          Write-Host "WARNING: nvcc not found at expected path"
+        }
+
+    - name: Setup vcpkg cache
+      uses: actions/cache@v4
+      with:
+        path: C:/vcpkg/installed
+        key: vcpkg-opencv-cuda-${{ runner.os }}-v2
+        restore-keys: vcpkg-opencv-cuda-${{ runner.os }}-
+
     - name: Install OpenCV with CUDA via vcpkg
       shell: pwsh
       run: |
         cd C:/vcpkg
-        ./vcpkg install opencv4[contrib,cuda,nonfree]:x64-windows --recurse
+        git pull
+
+        # Set CUDA path for vcpkg
+        $env:CUDA_PATH = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+        $env:CUDA_BIN_PATH = "$env:CUDA_PATH\bin"
+
+        Write-Host "Installing OpenCV with CUDA support..."
+        # Use manifest mode with specific features
+        ./vcpkg install `
+          "opencv4[core,highgui,videoio,imgproc,imgcodecs,calib3d,features2d,cuda,cudaarithm,cudabgsegm,cudafilters,cudaimgproc,nonfree,contrib]:x64-windows" `
+          --recurse `
+          --no-print-usage
+
+        $opencvDir = "C:/vcpkg/installed/x64-windows/share/opencv4"
+        echo "OpenCV_DIR=$opencvDir" >> $env:GITHUB_ENV
         echo "VCPKG_ROOT=C:/vcpkg" >> $env:GITHUB_ENV
-        echo "OpenCV_DIR=C:/vcpkg/installed/x64-windows/share/opencv4" >> $env:GITHUB_ENV
+        Write-Host "OpenCV_DIR=$opencvDir"
+
+    - name: Setup MSVC
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
 
     - name: Configure CMake
       shell: pwsh
       run: |
+        $cudaPath = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4"
+
         cmake -B build -S . `
+          -G "Visual Studio 17 2022" -A x64 `
           -DCMAKE_BUILD_TYPE=Release `
           -DENABLE_CUDA=ON `
-          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" `
           -DOpenCV_DIR="$env:OpenCV_DIR" `
-          -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" `
-          -G "Visual Studio 17 2022" -A x64
+          -DCUDA_TOOLKIT_ROOT_DIR="$cudaPath" `
+          -DCMAKE_CUDA_COMPILER="$cudaPath/bin/nvcc.exe"
 
-    - name: Build
+    - name: Build Release
       shell: pwsh
       run: |
-        cmake --build build --config Release --parallel
+        cmake --build build --config Release --parallel 4
 
-    - name: Deploy Qt DLLs (windeployqt)
+    - name: Deploy Qt DLLs
       shell: pwsh
       run: |
-        $exePath = "build/Release/AnalisiVideoSperimentaleAvanzata.exe"
-        & "$env:Qt6_DIR/bin/windeployqt.exe" --release --no-translations $exePath
-
-    - name: Copy OpenCV and CUDA DLLs
-      shell: pwsh
-      run: |
-        $dest = "build/Release"
-        Copy-Item "C:/vcpkg/installed/x64-windows/bin/opencv_world4*.dll" $dest -Force -ErrorAction SilentlyContinue
-        Copy-Item "C:/vcpkg/installed/x64-windows/bin/opencv_cuda*.dll" $dest -Force -ErrorAction SilentlyContinue
-        $cudaPath = $env:CUDA_PATH
-        if ($cudaPath) {
-          Copy-Item "$cudaPath/bin/cudart64_*.dll" $dest -Force -ErrorAction SilentlyContinue
-          Copy-Item "$cudaPath/bin/cublas64_*.dll" $dest -Force -ErrorAction SilentlyContinue
-          Copy-Item "$cudaPath/bin/cublasLt64_*.dll" $dest -Force -ErrorAction SilentlyContinue
+        $exePath = "build\Release\AnalisiVideoSperimentaleAvanzata.exe"
+        if (Test-Path $exePath) {
+          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler $exePath
+          Write-Host "windeployqt completed"
+        } else {
+          Write-Host "ERROR: exe not found at $exePath"
+          Get-ChildItem build\Release
+          exit 1
         }
 
-    - name: Create ZIP artifact
+    - name: Copy runtime DLLs
       shell: pwsh
       run: |
-        Compress-Archive -Path "build/Release/*" -DestinationPath "AVSA-Windows-x64.zip"
+        $dest = "build\Release"
+
+        # OpenCV DLLs
+        $vcpkgBin = "C:/vcpkg/installed/x64-windows/bin"
+        Get-ChildItem "$vcpkgBin\opencv*.dll" | Copy-Item -Destination $dest -Force
+        Write-Host "Copied OpenCV DLLs"
+
+        # CUDA runtime DLLs
+        $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin"
+        if (Test-Path $cudaBin) {
+          @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll") | ForEach-Object {
+            Get-ChildItem "$cudaBin\$_" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest -Force
+          }
+          Write-Host "Copied CUDA runtime DLLs"
+        }
+
+        # Other vcpkg runtime deps
+        Get-ChildItem "$vcpkgBin\tbb*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest -Force
+        Get-ChildItem "$vcpkgBin\ffmpeg*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest -Force
+
+    - name: Create release ZIP
+      shell: pwsh
+      run: |
+        $releaseDir = "build\Release"
+        Write-Host "Contents of release dir:"
+        Get-ChildItem $releaseDir | Select-Object Name, Length
+        Compress-Archive -Path "$releaseDir\*" -DestinationPath "AVSA-Windows-x64.zip" -Force
+        Write-Host "ZIP created: $(Get-Item AVSA-Windows-x64.zip | Select-Object -ExpandProperty Length) bytes"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
