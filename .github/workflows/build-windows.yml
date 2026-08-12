@@ -1,0 +1,88 @@
+name: Build Windows (Qt6 + OpenCV + CUDA)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install CUDA Toolkit 12.x
+      uses: Jimver/cuda-toolkit@v0.2.16
+      with:
+        cuda: '12.4.1'
+        method: 'network'
+        sub-packages: '["nvcc", "cudart", "cublas", "cublaslt"]'
+
+    - name: Install Qt6
+      uses: jurplel/install-qt-action@v3
+      with:
+        version: '6.7.3'
+        host: 'windows'
+        target: 'desktop'
+        arch: 'win64_msvc2019_64'
+        modules: 'qtbase qtnetwork'
+        cache: true
+
+    - name: Install OpenCV with CUDA via vcpkg
+      shell: pwsh
+      run: |
+        cd C:/vcpkg
+        ./vcpkg install opencv4[contrib,cuda,nonfree]:x64-windows --recurse
+        echo "VCPKG_ROOT=C:/vcpkg" >> $env:GITHUB_ENV
+        echo "OpenCV_DIR=C:/vcpkg/installed/x64-windows/share/opencv4" >> $env:GITHUB_ENV
+
+    - name: Configure CMake
+      shell: pwsh
+      run: |
+        cmake -B build -S . `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DENABLE_CUDA=ON `
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DOpenCV_DIR="$env:OpenCV_DIR" `
+          -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" `
+          -G "Visual Studio 17 2022" -A x64
+
+    - name: Build
+      shell: pwsh
+      run: |
+        cmake --build build --config Release --parallel
+
+    - name: Deploy Qt DLLs (windeployqt)
+      shell: pwsh
+      run: |
+        $exePath = "build/Release/AnalisiVideoSperimentaleAvanzata.exe"
+        & "$env:Qt6_DIR/bin/windeployqt.exe" --release --no-translations $exePath
+
+    - name: Copy OpenCV and CUDA DLLs
+      shell: pwsh
+      run: |
+        $dest = "build/Release"
+        Copy-Item "C:/vcpkg/installed/x64-windows/bin/opencv_world4*.dll" $dest -Force -ErrorAction SilentlyContinue
+        Copy-Item "C:/vcpkg/installed/x64-windows/bin/opencv_cuda*.dll" $dest -Force -ErrorAction SilentlyContinue
+        $cudaPath = $env:CUDA_PATH
+        if ($cudaPath) {
+          Copy-Item "$cudaPath/bin/cudart64_*.dll" $dest -Force -ErrorAction SilentlyContinue
+          Copy-Item "$cudaPath/bin/cublas64_*.dll" $dest -Force -ErrorAction SilentlyContinue
+          Copy-Item "$cudaPath/bin/cublasLt64_*.dll" $dest -Force -ErrorAction SilentlyContinue
+        }
+
+    - name: Create ZIP artifact
+      shell: pwsh
+      run: |
+        Compress-Archive -Path "build/Release/*" -DestinationPath "AVSA-Windows-x64.zip"
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: AVSA-Windows-x64
+        path: AVSA-Windows-x64.zip
+        retention-days: 30
