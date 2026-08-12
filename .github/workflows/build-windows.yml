@@ -80,7 +80,8 @@ jobs:
       shell: pwsh
       run: |
         $cudaPath = $env:CUDA_PATH
-        cmake -B build -S . `
+        $srcDir = $env:GITHUB_WORKSPACE
+        cmake -B "$srcDir\build" -S "$srcDir" `
           -G "Visual Studio 17 2022" -A x64 `
           -DCMAKE_BUILD_TYPE=Release `
           -DENABLE_CUDA=ON `
@@ -91,25 +92,28 @@ jobs:
     - name: Build Release
       shell: pwsh
       run: |
-        cmake --build build --config Release --parallel 4
+        $srcDir = $env:GITHUB_WORKSPACE
+        cmake --build "$srcDir\build" --config Release --parallel 4
 
     - name: Deploy Qt DLLs
       shell: pwsh
       run: |
-        $exePath = "build\Release\AnalisiVideoSperimentaleAvanzata.exe"
+        $srcDir = $env:GITHUB_WORKSPACE
+        $exePath = "$srcDir\build\Release\AnalisiVideoSperimentaleAvanzata.exe"
         if (Test-Path $exePath) {
           & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations $exePath
           Write-Host "windeployqt OK"
         } else {
-          Write-Host "ERROR: exe not found"
-          Get-ChildItem build\Release -ErrorAction SilentlyContinue
+          Write-Host "ERROR: exe not found, listing build\Release:"
+          Get-ChildItem "$srcDir\build\Release" -ErrorAction SilentlyContinue
           exit 1
         }
 
     - name: Copy OpenCV and CUDA runtime DLLs
       shell: pwsh
       run: |
-        $dest = "build\Release"
+        $srcDir = $env:GITHUB_WORKSPACE
+        $dest = "$srcDir\build\Release"
         # OpenCV DLLs
         if ($env:OPENCV_BIN -and (Test-Path $env:OPENCV_BIN)) {
           Get-ChildItem "$env:OPENCV_BIN\opencv_world*.dll" -ErrorAction SilentlyContinue | Copy-Item -Destination $dest -Force
@@ -127,8 +131,9 @@ jobs:
     - name: Create ZIP artifact
       shell: pwsh
       run: |
-        Compress-Archive -Path "build\Release\*" -DestinationPath "AVSA-Windows-x64.zip" -Force
-        Write-Host "ZIP size: $((Get-Item AVSA-Windows-x64.zip).Length) bytes"
+        $srcDir = $env:GITHUB_WORKSPACE
+        Compress-Archive -Path "$srcDir\build\Release\*" -DestinationPath "$srcDir\AVSA-Windows-x64.zip" -Force
+        Write-Host "ZIP size: $((Get-Item "$srcDir\AVSA-Windows-x64.zip").Length) bytes"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
