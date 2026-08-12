@@ -23,7 +23,6 @@ jobs:
         host: 'windows'
         target: 'desktop'
         arch: 'win64_msvc2019_64'
-        modules: 'qtbase qtnetwork'
         cache: true
 
     - name: Install CUDA Toolkit 12.4 (dev components only)
